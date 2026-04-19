@@ -1,0 +1,114 @@
+stages:
+  - test
+  - build
+  - deploy
+  - notify
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  DOCKER_IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+  DEPLOY_TIMEOUT: "120s"
+  STAGING_NAMESPACE: staging
+  PROD_NAMESPACE: production
+
+# ── Test Stage ────────────────────────────────────────────────────────────────
+
+test:unit:
+  stage: test
+  image: python:3.12
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache
+  before_script:
+    - pip install --cache-dir .pip-cache -r requirements.txt
+  script:
+    - pytest tests/unit -v --tb=short --junitxml=report.xml
+  artifacts:
+    reports:
+      junit: report.xml
+  only:
+    - merge_requests
+    - main
+
+test:lint:
+  stage: test
+  image: python:3.12
+  script:
+    - pip install ruff
+    - ruff check app/
+  only:
+    - merge_requests
+    - main
+
+# ── Build Stage ───────────────────────────────────────────────────────────────
+
+build:docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $DOCKER_IMAGE -t $DOCKER_IMAGE_LATEST .
+    - docker push $DOCKER_IMAGE
+    - docker push $DOCKER_IMAGE_LATEST
+  only:
+    - main
+  needs:
+    - test:unit
+    - test:lint
+
+# ── Deploy Stage ──────────────────────────────────────────────────────────────
+
+deploy:staging:
+  stage: deploy
+  image: alpine/k8s:1.28.2
+  environment:
+    name: staging
+    url: https://staging.stacklore.io
+  before_script:
+    - echo $KUBECONFIG_STAGING | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+  script:
+    - kubectl set image deployment/app app=$DOCKER_IMAGE -n $STAGING_NAMESPACE
+    - kubectl rollout status deployment/app -n $STAGING_NAMESPACE --timeout=$DEPLOY_TIMEOUT
+  only:
+    - main
+  needs:
+    - build:docker
+
+deploy:production:
+  stage: deploy
+  image: alpine/k8s:1.28.2
+  environment:
+    name: production
+    url: https://stacklore.io
+  before_script:
+    - echo $KUBECONFIG_PROD | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+  script:
+    - kubectl set image deployment/app app=$DOCKER_IMAGE -n $PROD_NAMESPACE
+    - kubectl rollout status deployment/app -n $PROD_NAMESPACE --timeout=$DEPLOY_TIMEOUT
+  only:
+    - main
+  when: manual
+  needs:
+    - deploy:staging
+
+# ── Notify Stage ──────────────────────────────────────────────────────────────
+
+notify:slack:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK_URL \
+        -H "Content-Type: application/json" \
+        -d "{\"text\":\"✅ Deployed $CI_COMMIT_SHORT_SHA to staging — $CI_COMMIT_MESSAGE\"}"
+  only:
+    - main
+  when: on_success
+  needs:
+    - deploy:staging
