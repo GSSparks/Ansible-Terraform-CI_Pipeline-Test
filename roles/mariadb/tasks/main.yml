@@ -1,0 +1,90 @@
+---
+- name: Install MariaDB packages
+  apt:
+    name:
+      - mariadb-server
+      - mariadb-client
+      - python3-pymysql
+    state: present
+    update_cache: yes
+
+- name: Ensure MariaDB is started and enabled
+  service:
+    name: mariadb
+    state: started
+    enabled: true
+
+# Wait for socket to be ready (prevents race conditions)
+- name: Wait for MariaDB to be ready
+  wait_for:
+    port: 3306
+    host: 127.0.0.1
+    delay: 2
+    timeout: 30
+
+# Set root password (only runs if not already set)
+- name: Set MariaDB root password
+  mysql_user:
+    name: root
+    host: localhost
+    password: "{{ mariadb_root_password }}"
+    login_unix_socket: /var/run/mysqld/mysqld.sock
+    check_implicit_admin: true
+    state: present
+
+# Ensure root uses password auth
+- name: Ensure root login uses password
+  mysql_user:
+    name: root
+    host: localhost
+    password: "{{ mariadb_root_password }}"
+    plugin: mysql_native_password
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+    state: present
+
+# Remove anonymous users
+- name: Remove anonymous MariaDB users
+  mysql_user:
+    name: ''
+    host_all: true
+    state: absent
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+
+# Remove test database
+- name: Remove test database
+  mysql_db:
+    name: test
+    state: absent
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+
+# Create application database
+- name: Create Stacklore database
+  mysql_db:
+    name: "{{ mariadb_db }}"
+    state: present
+    encoding: utf8mb4
+    collation: utf8mb4_general_ci
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+
+# Create application user
+- name: Create Stacklore DB user
+  mysql_user:
+    name: "{{ mariadb_user }}"
+    password: "{{ mariadb_password }}"
+    host: "%"
+    priv: "{{ mariadb_db }}.*:ALL"
+    state: present
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+
+# Optional: bind to all interfaces (for dev/testing)
+- name: Allow remote connections (dev only)
+  lineinfile:
+    path: /etc/mysql/mariadb.conf.d/50-server.cnf
+    regexp: '^bind-address'
+    line: 'bind-address = 0.0.0.0'
+  notify: Restart MariaDB
